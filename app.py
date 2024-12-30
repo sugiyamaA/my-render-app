@@ -39,6 +39,31 @@ def ask():
         answer = f"Error occurred: {e}"
 
     return jsonify({"answer": answer})
+@app.route("/chat")
+def chat_page():
+    return """
+    <html>
+    <body>
+      <h1>簡易チャットテスト</h1>
+      <input type="text" id="question" placeholder="質問を入力" />
+      <button onclick="sendMessage()">送信</button>
+      <pre id="responseArea"></pre>
+      
+      <script>
+        async function sendMessage() {
+          const questionValue = document.getElementById('question').value;
+          const resp = await fetch('/ask', {
+            method: 'POST',
+            headers: { 'Content-Type': 'application/json' },
+            body: JSON.stringify({ question: questionValue })
+          });
+          const data = await resp.json();
+          document.getElementById('responseArea').innerText = JSON.stringify(data, null, 2);
+        }
+      </script>
+    </body>
+    </html>
+    """
 
 # ローカル開発用 (Render では gunicorn で起動する)
 if __name__ == "__main__":
