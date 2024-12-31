@@ -14,7 +14,7 @@ from flask import Flask, request, jsonify
 app = Flask(__name__)
 
 # ======================
-# 1. Azure OpenAI 用設定
+# 1. Azure OpenAI 用設定 (必要なら使用)
 # ======================
 openai.api_type = "azure"
 openai.api_base = os.getenv("AZURE_OPENAI_API_BASE")       # 例: "https://xxxx.openai.azure.com/"
@@ -30,8 +30,10 @@ CSV_PATH = os.path.join(os.path.dirname(__file__), "data", "survey_data.csv")
 if os.path.exists(CSV_PATH):
     df = pd.read_csv(CSV_PATH)
     print("=== CSV Loaded Successfully ===")
+    print(f"CSV_PATH: {CSV_PATH}")
 else:
     print("=== CSV NOT FOUND, using demo data ===")
+    # デモ用のダミーデータ(列名はQ1〜Q7)
     df = pd.DataFrame({
         "Q1 (安全装備パッケージ)": ["BASIC", "STANDARD", "ADVANCE", "BASIC", "PREMIUM"],
         "Q2 (荷台形状)": ["バン/ウィング", "平ボディ", "平ボディ", "ダンプ", "温度管理車"],
@@ -44,94 +46,41 @@ else:
 
 print("=== Current df.columns ===", df.columns.tolist())
 
-# ======================
-# 3. 質問マッピング (列名 + キーワード)
-# ======================
-QUESTION_MAP = [
-    {
-        "column": "Q1 (安全装備パッケージ)",
-        "keywords": ["q1", "安全装備", "パッケージ", "basic", "standard", "advance", "premium"]
-    },
-    {
-        "column": "Q2 (荷台形状)",
-        "keywords": ["q2", "荷台", "形状", "ウィング", "平ボディ", "ダンプ", "架装"]
-    },
-    {
-        "column": "Q3 (稼働日数)",
-        "keywords": ["q3", "稼働日", "何日", "日数"]
-    },
-    {
-        "column": "Q4 (稼働時間)",
-        "keywords": ["q4", "稼働時間", "何時間", "時間"]
-    },
-    {
-        "column": "Q5 (休憩時間)",
-        "keywords": ["q5", "休憩", "休憩時間"]
-    },
-    {
-        "column": "Q6 (走行距離)",
-        "keywords": ["q6", "走行距離", "km", "何km"]
-    },
-    {
-        "column": "Q7 (燃費(km/L))",
-        "keywords": ["q7", "燃費", "km/l", "何キロ", "kml"]
-    },
-]
 
+# ======================
+# 3. ファジー検索の仕組み (列名との類似度)
+# ======================
 def normalized(s: str) -> str:
-    """
-    空白や丸括弧などを除去し、小文字化して比較用に正規化する
-    """
+    """ 空白やカッコなどを除去して小文字化して比較用に正規化 """
     s = s.lower()
-    # スペース, (), 全角半角カッコなどをすべて取り除く
-    s = re.sub(r"[()\s（）]", "", s)
+    s = re.sub(r"[()\s（）]", "", s)  # カッコや空白を全部除去
     return s
 
 def calc_similarity(a: str, b: str) -> float:
-    """
-    2つの文字列の類似度を 0.0〜1.0 で返す
-    (difflib.SequenceMatcherベース)
-    空白や括弧などを除去したうえで比較
-    """
+    """ 2文字列の類似度(0.0〜1.0) """
     a_norm = normalized(a)
     b_norm = normalized(b)
     return SequenceMatcher(None, a_norm, b_norm).ratio()
 
-
 def find_best_column(user_question: str):
     """
-    ユーザの質問文と (各カラム名 + キーワード) を fuzzyマッチして
-    類似度最大のカラムを返す。
-    - 0.0〜1.0 のスコアで0.6以上を「合格」とし
-      もっとも高いスコアが1件だけならそのカラム名を返す。
-    - 0件または複数件なら None (曖昧)。
+    ユーザ入力と df.columns の各列名をファジーマッチし、
+    もっとも似ている列とそのスコアを返す。
+    スコアが一定の閾値未満なら None。
     """
     best_col = None
     best_score = 0.0
+    for col in df.columns:
+        score = calc_similarity(user_question, col)
+        if score > best_score:
+            best_score = score
+            best_col = col
 
-    for item in QUESTION_MAP:
-        col_name = item["column"]
-        # synonyms: カラム名 + キーワード
-        synonyms = [col_name] + item["keywords"]
-
-        # synonyms の中で最大スコアを出すものを計測
-        local_best = 0.0
-        for syn in synonyms:
-            score = calc_similarity(user_question, syn)
-            if score > local_best:
-                local_best = score
-
-        # そのカラムに対する最大スコアが全体のベストより高ければ更新
-        if local_best > best_score:
-            best_score = local_best
-            best_col = col_name
-
-    # 閾値を設定 (例: 0.6)
-    if best_score < 0.6:
-        return None  # 低すぎる → 見つからない
-
-    # TODO: 同率トップが複数あるケースの考慮 → ここでは割愛し、上書きされた方を使う
-    return best_col
+    # 閾値を設定 (例: 0.4〜0.7 お好みで調整)
+    if best_score < 0.4:
+        return None
+    else:
+        return best_col
 
 
 def get_distribution_text_and_chart(column_name: str):
@@ -139,10 +88,13 @@ def get_distribution_text_and_chart(column_name: str):
     指定カラムの回答分布または統計をテキストとグラフ(Base64)で返す。
     """
     if column_name not in df.columns:
-        return (f"'{column_name}' はデータに存在しません。", None)
+        # ここに来るケースはほぼ無いが、一応対処
+        return f"列 '{column_name}' はデータに存在しません。", None
 
     series = df[column_name]
+    # 数値カラム vs 文字列カラム
     if series.dtype in [float, int]:
+        # 数値データ → describe & ヒストグラム
         desc = series.describe()
         text_answer = f"【{column_name} の統計情報】\n"
         text_answer += f"- 件数: {desc['count']}\n"
@@ -151,16 +103,16 @@ def get_distribution_text_and_chart(column_name: str):
         text_answer += f"- 最大: {desc['max']:.2f}\n"
         counts = pd.cut(series, bins=5).value_counts().sort_index()
     else:
+        # 文字列データ → value_counts
         counts = series.value_counts()
         text_answer = f"【{column_name} の回答分布】(多い順)\n"
         for idx, val in counts.items():
             text_answer += f"- {idx}: {val} 件\n"
 
-    # グラフ生成
+    # グラフ (matplotlib)
     fig, ax = plt.subplots(figsize=(4,3))
     counts.plot(kind='bar', ax=ax)
     ax.set_title(f"{column_name}")
-    ax.set_xlabel("区分" if series.dtype in [float, int] else "回答")
     ax.set_ylabel("件数")
     plt.tight_layout()
 
@@ -176,53 +128,51 @@ def get_distribution_text_and_chart(column_name: str):
 # ======================
 # 4. Flaskルート
 # ======================
+app = Flask(__name__)
+
 @app.route("/")
 def index():
-    return "Hello from Render + Flask + Azure OpenAI (Fuzzy Q1~Q7)"
+    return "Hello from Fuzzy Chat! - CSV columns direct match"
 
 @app.route("/ask", methods=["POST"])
 def ask():
+    """
+    ユーザの入力: { "question": "安全装備パッケージ" } など
+    1) df.columns とファジーマッチで最適列を探す
+    2) 見つかれば集計結果を返す
+    3) なければ「どれを見ればよいかわかりません」と返す
+    """
     data = request.json
     user_question = data.get("question", "").strip()
-
     best_col = find_best_column(user_question)
-    if best_col is not None:
+
+    if best_col:
         text_ans, chart_base64 = get_distribution_text_and_chart(best_col)
         return jsonify({"answer": text_ans, "image": chart_base64})
     else:
-        clarification_msg = """質問が曖昧です。以下のどれかを含む文言でもう一度質問してください。
-- Q1(安全装備パッケージ)
-- Q2(荷台形状)
-- Q3(稼働日数)
-- Q4(稼働時間)
-- Q5(休憩時間)
-- Q6(走行距離)
-- Q7(燃費)"""
-        return jsonify({"answer": clarification_msg, "image": None})
-
+        return jsonify({"answer": "すみません、該当する項目が見つかりませんでした。もう少し具体的に教えてください。", "image": None})
 
 @app.route("/chat")
 def chat_page():
     """
-    レスポンシブ対応のHTMLチャットUI (フル画面＋スマホ対応)
+    フル画面&スマホ対応のチャットUI
     """
-    print("=== DEBUG: df.columns ===", df.columns.tolist())
-
+    # ログに列名を出して確認
+    print("=== DEBUG df.columns ===", df.columns.tolist())
     return """
     <!DOCTYPE html>
     <html lang="ja">
     <head>
-      <meta charset="UTF-8">
-      <title>アンケート分析チャット(ファジー対応版)</title>
-      <meta name="viewport" content="width=device-width, initial-scale=1.0">
+      <meta charset="UTF-8" />
+      <title>Fuzzy CSV Chat</title>
+      <meta name="viewport" content="width=device-width, initial-scale=1.0"/>
       <style>
         body {
-          font-family: sans-serif;
-          margin: 20px;
+          font-family: sans-serif; margin: 20px;
         }
         #chatArea {
           border: 1px solid #ccc;
-          width: 80vw;   
+          width: 80vw;
           height: 65vh;
           max-width: 1000px;
           margin-bottom: 10px;
@@ -235,11 +185,11 @@ def chat_page():
           }
         }
         .msg-user {
-          text-align: right; 
+          text-align: right;
           margin: 5px;
         }
         .msg-ai {
-          text-align: left; 
+          text-align: left;
           margin: 5px;
         }
         .bubble-user {
@@ -260,13 +210,12 @@ def chat_page():
         }
         img {
           max-width: 100%;
-          display: block;
           margin-top: 5px;
         }
       </style>
     </head>
     <body>
-      <h1>アンケート分析チャット(ファジー対応版)</h1>
+      <h1>アンケート分析チャット(Fuzzy検索版)</h1>
       <div id="chatArea"></div>
       <div>
         <input type="text" id="question" placeholder="質問を入力" style="width:70%;" />
@@ -293,7 +242,10 @@ def chat_page():
               }
               chatArea.innerHTML += `
                 <div class="msg-ai">
-                  <div class="bubble-ai">${msg.content.replace(/\\n/g,"<br/>")}${imageTag}</div>
+                  <div class="bubble-ai">
+                    ${msg.content.replace(/\\n/g, "<br/>")}
+                    ${imageTag}
+                  </div>
                 </div>
               `;
             }
@@ -310,10 +262,10 @@ def chat_page():
           renderMessages();
           document.getElementById('question').value = "";
 
-          // POST
+          // サーバに POST
           const resp = await fetch("/ask", {
             method: "POST",
-            headers: { "Content-Type": "application/json" },
+            headers: {"Content-Type": "application/json"},
             body: JSON.stringify({ question: questionValue })
           });
           const data = await resp.json();
