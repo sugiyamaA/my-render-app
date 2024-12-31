@@ -11,7 +11,7 @@ from flask import Flask, request, jsonify
 
 app = Flask(__name__)
 
-# ----- Azure OpenAI用の設定 -----
+# ----- Azure OpenAI用の設定２ -----
 openai.api_type = "azure"
 openai.api_base = os.getenv("AZURE_OPENAI_API_BASE")       # 例: "https://xxxx.openai.azure.com/"
 openai.api_version = os.getenv("AZURE_OPENAI_API_VERSION") # 例: "2023-05-15" or "2023-06-13"
