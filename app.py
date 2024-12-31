@@ -2,37 +2,36 @@ import os
 import openai
 import pandas as pd
 import matplotlib
-matplotlib.use('Agg')  # Flaskサーバー上でmatplotlibを使うための設定
+matplotlib.use('Agg')
 import matplotlib.pyplot as plt
 import io
 import base64
+import re
 
+from difflib import SequenceMatcher
 from flask import Flask, request, jsonify
 
 app = Flask(__name__)
 
 # ======================
-# 1. Azure OpenAI用設定
+# 1. Azure OpenAI 用設定
 # ======================
 openai.api_type = "azure"
-openai.api_base = os.getenv("AZURE_OPENAI_API_BASE")       # "https://xxxx.openai.azure.com/"
-openai.api_version = os.getenv("AZURE_OPENAI_API_VERSION") # "2023-05-15" / "2023-06-13" etc.
+openai.api_base = os.getenv("AZURE_OPENAI_API_BASE")       # 例: "https://xxxx.openai.azure.com/"
+openai.api_version = os.getenv("AZURE_OPENAI_API_VERSION") # 例: "2023-05-15" or "2023-06-13"
 openai.api_key = os.getenv("AZURE_OPENAI_API_KEY")
-
-DEPLOYMENT_NAME = os.getenv("AZURE_OPENAI_DEPLOYMENT_NAME") # 例: "gpt-35-turbo" or "gpt-4"
+DEPLOYMENT_NAME = os.getenv("AZURE_OPENAI_DEPLOYMENT_NAME")# 例: "gpt-35-turbo" or "gpt-4"
 
 # ======================
 # 2. CSV読み込み
 # ======================
 CSV_PATH = os.path.join(os.path.dirname(__file__), "data", "survey_data.csv")
 
-# CSV列名が不明の場合にデバッグしやすいように、実際に読み込めたかチェック
 if os.path.exists(CSV_PATH):
     df = pd.read_csv(CSV_PATH)
     print("=== CSV Loaded Successfully ===")
-    print(f"CSV_PATH: {CSV_PATH}")
 else:
-    print("=== CSV not found, using demo data. ===")
+    print("=== CSV NOT FOUND, using demo data ===")
     df = pd.DataFrame({
         "Q1 (安全装備パッケージ)": ["BASIC", "STANDARD", "ADVANCE", "BASIC", "PREMIUM"],
         "Q2 (荷台形状)": ["バン/ウィング", "平ボディ", "平ボディ", "ダンプ", "温度管理車"],
@@ -43,27 +42,23 @@ else:
         "Q7 (燃費(km/L))": [10.5, 12.3, 9.8, 15.0, 7.6],
     })
 
-# デバッグ: 読み込んだ列名をログ出力
-print("=== Current df.columns ===")
-for col in df.columns:
-    print(f"col: '{col}'")
-
+print("=== Current df.columns ===", df.columns.tolist())
 
 # ======================
-# 3. Q列とキーワードのマッピング
+# 3. 質問マッピング (列名 + キーワード)
 # ======================
 QUESTION_MAP = [
     {
         "column": "Q1 (安全装備パッケージ)",
-        "keywords": ["q1", "安全", "安全装備", "パッケージ", "basic", "standard", "advance", "premium"]
+        "keywords": ["q1", "安全装備", "パッケージ", "basic", "standard", "advance", "premium"]
     },
     {
         "column": "Q2 (荷台形状)",
-        "keywords": ["q2", "荷台", "形状", "架装", "ウィング", "バン", "平ボディ", "ダンプ"]
+        "keywords": ["q2", "荷台", "形状", "ウィング", "平ボディ", "ダンプ", "架装"]
     },
     {
         "column": "Q3 (稼働日数)",
-        "keywords": ["q3", "稼働日", "稼働日数", "日数", "何日"]
+        "keywords": ["q3", "稼働日", "何日", "日数"]
     },
     {
         "column": "Q4 (稼働時間)",
@@ -75,36 +70,68 @@ QUESTION_MAP = [
     },
     {
         "column": "Q6 (走行距離)",
-        "keywords": ["q6", "走行距離", "距離", "km"]
+        "keywords": ["q6", "走行距離", "km", "何km"]
     },
     {
         "column": "Q7 (燃費(km/L))",
-        "keywords": ["q7", "燃費", "km/l", "何km", "何キロ"]
+        "keywords": ["q7", "燃費", "km/l", "何キロ", "kml"]
     },
 ]
+
+def normalized(s: str) -> str:
+    """
+    空白や丸括弧などを除去し、小文字化して比較用に正規化する
+    """
+    s = s.lower()
+    # スペース, (), 全角半角カッコなどをすべて取り除く
+    s = re.sub(r"[()\s（）]", "", s)
+    return s
+
+def calc_similarity(a: str, b: str) -> float:
+    """
+    2つの文字列の類似度を 0.0〜1.0 で返す
+    (difflib.SequenceMatcherベース)
+    空白や括弧などを除去したうえで比較
+    """
+    a_norm = normalized(a)
+    b_norm = normalized(b)
+    return SequenceMatcher(None, a_norm, b_norm).ratio()
 
 
 def find_best_column(user_question: str):
     """
-    質問文に含まれるキーワードとQUESTION_MAPを照合し、
-    最もマッチしそうなカラム名を返す。
-    0件や複数ヒットの場合は None で返す。
+    ユーザの質問文と (各カラム名 + キーワード) を fuzzyマッチして
+    類似度最大のカラムを返す。
+    - 0.0〜1.0 のスコアで0.6以上を「合格」とし
+      もっとも高いスコアが1件だけならそのカラム名を返す。
+    - 0件または複数件なら None (曖昧)。
     """
-    user_question_lower = user_question.lower()
-    matched_columns = []
+    best_col = None
+    best_score = 0.0
 
     for item in QUESTION_MAP:
-        col = item["column"]
-        for kw in item["keywords"]:
-            if kw.lower() in user_question_lower:
-                matched_columns.append(col)
-                break
+        col_name = item["column"]
+        # synonyms: カラム名 + キーワード
+        synonyms = [col_name] + item["keywords"]
 
-    matched_columns = list(set(matched_columns))
-    if len(matched_columns) == 1:
-        return matched_columns[0]
-    else:
-        return None
+        # synonyms の中で最大スコアを出すものを計測
+        local_best = 0.0
+        for syn in synonyms:
+            score = calc_similarity(user_question, syn)
+            if score > local_best:
+                local_best = score
+
+        # そのカラムに対する最大スコアが全体のベストより高ければ更新
+        if local_best > best_score:
+            best_score = local_best
+            best_col = col_name
+
+    # 閾値を設定 (例: 0.6)
+    if best_score < 0.6:
+        return None  # 低すぎる → 見つからない
+
+    # TODO: 同率トップが複数あるケースの考慮 → ここでは割愛し、上書きされた方を使う
+    return best_col
 
 
 def get_distribution_text_and_chart(column_name: str):
@@ -115,9 +142,7 @@ def get_distribution_text_and_chart(column_name: str):
         return (f"'{column_name}' はデータに存在しません。", None)
 
     series = df[column_name]
-
     if series.dtype in [float, int]:
-        # 数値データ → describe + ヒストグラム
         desc = series.describe()
         text_answer = f"【{column_name} の統計情報】\n"
         text_answer += f"- 件数: {desc['count']}\n"
@@ -126,22 +151,17 @@ def get_distribution_text_and_chart(column_name: str):
         text_answer += f"- 最大: {desc['max']:.2f}\n"
         counts = pd.cut(series, bins=5).value_counts().sort_index()
     else:
-        # 文字列データ → value_counts
         counts = series.value_counts()
         text_answer = f"【{column_name} の回答分布】(多い順)\n"
         for idx, val in counts.items():
             text_answer += f"- {idx}: {val} 件\n"
 
-    # matplotlib でグラフ生成
+    # グラフ生成
     fig, ax = plt.subplots(figsize=(4,3))
     counts.plot(kind='bar', ax=ax)
     ax.set_title(f"{column_name}")
-    if series.dtype in [float, int]:
-        ax.set_xlabel("値の区間")
-    else:
-        ax.set_xlabel("回答内容")
+    ax.set_xlabel("区分" if series.dtype in [float, int] else "回答")
     ax.set_ylabel("件数")
-
     plt.tight_layout()
 
     buf = io.BytesIO()
@@ -156,17 +176,12 @@ def get_distribution_text_and_chart(column_name: str):
 # ======================
 # 4. Flaskルート
 # ======================
-
 @app.route("/")
 def index():
-    return "Hello from Render + Flask + Azure OpenAI (Q1〜Q7対応)"
+    return "Hello from Render + Flask + Azure OpenAI (Fuzzy Q1~Q7)"
 
 @app.route("/ask", methods=["POST"])
 def ask():
-    """
-    ユーザの質問を受け取り、最適なQ列を探して集計結果を返す。
-    見つからなければ追加で質問を促す。
-    """
     data = request.json
     user_question = data.get("question", "").strip()
 
@@ -175,26 +190,22 @@ def ask():
         text_ans, chart_base64 = get_distribution_text_and_chart(best_col)
         return jsonify({"answer": text_ans, "image": chart_base64})
     else:
-        clarification_msg = """質問が曖昧です。以下のいずれかについて知りたいですか？
+        clarification_msg = """質問が曖昧です。以下のどれかを含む文言でもう一度質問してください。
 - Q1(安全装備パッケージ)
 - Q2(荷台形状)
 - Q3(稼働日数)
 - Q4(稼働時間)
 - Q5(休憩時間)
 - Q6(走行距離)
-- Q7(燃費)
-そのどれかを含む文言でもう一度質問してください。"""
+- Q7(燃費)"""
         return jsonify({"answer": clarification_msg, "image": None})
 
 
 @app.route("/chat")
 def chat_page():
     """
-    レスポンシブ対応のHTMLチャットUI
-    - フル画面に近い大きさ
-    - スマホでも見やすい
+    レスポンシブ対応のHTMLチャットUI (フル画面＋スマホ対応)
     """
-    # デバッグ: CSVの列名をログに出す（Renderのログで確認）
     print("=== DEBUG: df.columns ===", df.columns.tolist())
 
     return """
@@ -202,7 +213,7 @@ def chat_page():
     <html lang="ja">
     <head>
       <meta charset="UTF-8">
-      <title>アンケート分析チャット(Q1〜Q7対応)</title>
+      <title>アンケート分析チャット(ファジー対応版)</title>
       <meta name="viewport" content="width=device-width, initial-scale=1.0">
       <style>
         body {
@@ -211,13 +222,12 @@ def chat_page():
         }
         #chatArea {
           border: 1px solid #ccc;
-          width: 80vw;    /* レスポンシブ幅 */
-          height: 65vh;   /* レスポンシブ高さ */
+          width: 80vw;   
+          height: 65vh;
           max-width: 1000px;
           margin-bottom: 10px;
           overflow-y: auto;
         }
-        /* PCがさらに広い場合は余裕があればサイズUP */
         @media (min-width: 1024px) {
           #chatArea {
             width: 60vw;
@@ -225,11 +235,11 @@ def chat_page():
           }
         }
         .msg-user {
-          text-align: right;
+          text-align: right; 
           margin: 5px;
         }
         .msg-ai {
-          text-align: left;
+          text-align: left; 
           margin: 5px;
         }
         .bubble-user {
@@ -256,7 +266,7 @@ def chat_page():
       </style>
     </head>
     <body>
-      <h1>アンケート分析チャット(Q1〜Q7対応)</h1>
+      <h1>アンケート分析チャット(ファジー対応版)</h1>
       <div id="chatArea"></div>
       <div>
         <input type="text" id="question" placeholder="質問を入力" style="width:70%;" />
@@ -283,25 +293,24 @@ def chat_page():
               }
               chatArea.innerHTML += `
                 <div class="msg-ai">
-                  <div class="bubble-ai">${msg.content.replace(/\\n/g, "<br/>")}${imageTag}</div>
+                  <div class="bubble-ai">${msg.content.replace(/\\n/g,"<br/>")}${imageTag}</div>
                 </div>
               `;
             }
           });
-          // 下までスクロール
           chatArea.scrollTop = chatArea.scrollHeight;
         }
 
         async function sendMessage() {
-          const questionValue = document.getElementById('question').value;
+          const questionValue = document.getElementById('question').value.trim();
           if(!questionValue) return;
 
-          // ユーザメッセージ追加
+          // ユーザメッセージ
           messages.push({ role: "user", content: questionValue });
           renderMessages();
           document.getElementById('question').value = "";
 
-          // サーバに問い合わせ
+          // POST
           const resp = await fetch("/ask", {
             method: "POST",
             headers: { "Content-Type": "application/json" },
@@ -309,7 +318,7 @@ def chat_page():
           });
           const data = await resp.json();
 
-          // AIメッセージ追加
+          // AIメッセージ
           messages.push({
             role: "assistant",
             content: data.answer || "(no response)",
@@ -322,10 +331,5 @@ def chat_page():
     </html>
     """
 
-# ======================
-# ローカル実行 or Render本番
-# ======================
 if __name__ == "__main__":
-    # ローカルでテストする場合は下記コマンド:
-    # python app.py
     app.run(host="0.0.0.0", port=5000, debug=True)
