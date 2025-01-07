@@ -12,48 +12,52 @@ import matplotlib.font_manager as fm
 from difflib import SequenceMatcher
 from flask import Flask, request, jsonify
 
-# (A) Flask setup
+##################
+# Flask App
+##################
 app = Flask(__name__)
 
-#######################
-# (B) フォント設定
-#######################
+##################
+# 1) フォント設定
+##################
 local_font_path = os.path.join(os.path.dirname(__file__), "font", "NotoSansJP.ttf")
 if os.path.exists(local_font_path):
     try:
+        # font_managerを使って fontProp 作成
         font_prop = fm.FontProperties(fname=local_font_path)
         # キャッシュ再構築
-        fm._rebuild()  
+        fm._rebuild()
+        # rcParams にセット
         plt.rcParams["font.family"] = font_prop.get_name()
-        # デバッグ用
-        print("Using local font:", local_font_path, "->", font_prop.get_name())
+        print("Using local font:", font_prop.get_name())
     except Exception as e:
-        print("Error loading local font:", e)
+        print("Error loading font:", e)
         plt.rcParams["font.family"] = "sans-serif"
 else:
     print("Warning: NotoSansJP.ttf not found. Fallback to sans-serif.")
     plt.rcParams["font.family"] = "sans-serif"
 
-#######################
-# (C) CSV読み込み
-#######################
+##################
+# 2) CSV読み込み
+##################
 CSV_PATH = os.path.join(os.path.dirname(__file__), "data", "survey_data.csv")
 if os.path.exists(CSV_PATH):
     df = pd.read_csv(CSV_PATH, encoding="utf-8")
     print("CSV loaded:", CSV_PATH)
 else:
+    # デモデータ
     df = pd.DataFrame({
         "安全装備パッケージ": ["STANDARD", "PREMIUM", "ADVANCE", "BASIC", "PREMIUM"],
         "荷台形状": ["ミキサ", "ダンプ", "温度管理車", "バン/ウィング", "ミキサ"],
         "稼働日数": ["5日", "2日以下", "7日", "3～4日", "6日"],
     })
-    print("Using demo data (CSV not found)")
+    print("CSV not found, using demo data.")
 
-print("Columns:", df.columns.tolist())
+print("CSV columns:", df.columns.tolist())
 
-#######################
-# (D) 稼働日数を数値化サンプル
-#######################
+##################
+# 3) 稼働日数の数値化
+##################
 def parse_kadou_nissu(s):
     if not isinstance(s, str):
         return None
@@ -73,69 +77,65 @@ def parse_kadou_nissu(s):
 if "稼働日数" in df.columns:
     df["稼働日数_num"] = df["稼働日数"].apply(parse_kadou_nissu)
 
-#######################
-# (E) ファジーマッチ
-#######################
+##################
+# 4) ファジーマッチ
+##################
 def normalize_str(s: str) -> str:
     s = s.lower()
-    # 全角カッコや半角カッコ、空白など排除
     s = re.sub(r"[()\s（）]", "", s)
     return s
 
 def calc_similarity(a: str, b: str) -> float:
     return SequenceMatcher(None, normalize_str(a), normalize_str(b)).ratio()
 
-def find_best_column(user_text: str, threshold=0.3):
+def find_best_column(user_text: str, threshold=0.5):
     """
-    thresholdを0.3程度まで下げる。
-    例: 「荷台形状」「安全装備パッケージ」も認識しやすい。
+    threshold=0.5 に設定。
+    「あ」 -> 類似度が低すぎ -> None
+    「荷台形状」 -> ある程度合致。
     """
     best_score = 0.0
     best_col = None
     for col in df.columns:
         score = calc_similarity(user_text, col)
-        # デバッグ表示すると状況がわかる
-        # print(f"[DEBUG] {user_text} vs {col} -> {score}")
         if score > best_score:
             best_score = score
             best_col = col
+    # print(f"[DEBUG] {user_text} -> best:{best_col} score:{best_score}")
     if best_score < threshold:
         return None
     return best_col
 
-#######################
-# (F) ガイドメッセージ
-#######################
+##################
+# 5) ガイドメッセージ
+##################
 def get_guide_message():
-    guide = """【ガイド】
-以下のように質問できます:
+    guide_text = """【ガイド】
+以下のように質問してみてください:
+- 「安全装備パッケージがSTANDARD」
 - 「荷台形状がミキサ」
 - 「稼働日数が5日以上」
-- 「安全装備パッケージの分布」
-- 「稼働日数が5日以上 の 荷台形状」
+- 「荷台形状がダンプ の 安全装備パッケージ」
+(複数条件は「の」で区切り)
 
 使用可能な列:
 """
     for c in df.columns:
-        guide += f"- {c}\n"
-    return guide
+        guide_text += f"- {c}\n"
+    return guide_text
 
-#######################
-# (G) 条件解析
-#######################
+##################
+# 6) 条件解析
+##################
 def parse_conditions(user_text: str):
-    """
-    例: 「荷台形状がミキサ の 稼働日数が5日以上」
-    """
-    # 助詞排除
-    user_text = re.sub(r"[のでをにはが]", " ", user_text)
+    # 助詞除去
     user_text = user_text.replace("のグラフ", "")
+    user_text = re.sub(r"[のでをにはが]", " ", user_text)
     user_text = re.sub(r"\s+", " ", user_text).strip()
 
     filter_dict = {}
     target_col = None
 
-    # 日数表現
     pat_ge = re.compile(r"(\d+)日以上")
     pat_le = re.compile(r"(\d+)日以下")
     pat_eq = re.compile(r"(\d+)日")
@@ -146,12 +146,10 @@ def parse_conditions(user_text: str):
     for t in tokens:
         c = find_best_column(t)
         if c:
-            # 新しく認識したカラム
             col_in_focus = c
             continue
 
         if col_in_focus:
-            # 数値比較か文字列か
             m_ge = pat_ge.search(t)
             m_le = pat_le.search(t)
             m_eq_ = pat_eq.search(t)
@@ -169,11 +167,11 @@ def parse_conditions(user_text: str):
                 filter_dict[col_in_focus] = ("==", val)
                 col_in_focus = None
             else:
-                # 文字列一致
+                # 文字
                 filter_dict[col_in_focus] = ("==", t)
                 col_in_focus = None
 
-    # 文末付近にもう1回カラムらしき文字列が出たらターゲット
+    # 文末付近でターゲット列を探す
     for t in reversed(tokens):
         c = find_best_column(t)
         if c:
@@ -181,22 +179,22 @@ def parse_conditions(user_text: str):
             break
 
     if not target_col:
-        target_col = df.columns[0]  # デフォルト
+        target_col = df.columns[0]
 
     return filter_dict, target_col
 
-#######################
-# (H) フィルタ適用
-#######################
-def apply_filters(df_in, filter_dict: dict):
+##################
+# 7) フィルタ適用
+##################
+def apply_filters(df_in: pd.DataFrame, filter_dict: dict):
     filtered = df_in.copy()
 
     for col, (op, val) in filter_dict.items():
         if col not in filtered.columns:
             continue
 
-        # 稼働日数_num があれば数値比較
         if col == "稼働日数" and "稼働日数_num" in filtered.columns:
+            # 数値比較
             m_num = re.search(r"(\d+)", val)
             if m_num:
                 v = float(m_num.group(1))
@@ -217,34 +215,33 @@ def apply_filters(df_in, filter_dict: dict):
 
     return filtered
 
-#######################
-# (I) グラフ生成
-#######################
-def get_distribution_and_chart(df_in, column_name: str):
+##################
+# 8) グラフ生成
+##################
+def get_distribution_and_chart(df_in: pd.DataFrame, column_name: str):
     if column_name not in df_in.columns:
         return f"列 '{column_name}' は存在しません。", None
 
     series = df_in[column_name]
     if len(series) == 0:
-        return f"列 '{column_name}' のデータがありません。", None
+        return f"列 '{column_name}' にデータがありません。", None
 
     if series.dtype in [int, float]:
         desc = series.describe()
-        msg = f"【{column_name} の統計】\n"
-        msg += f"- 件数: {desc['count']}\n"
-        msg += f"- 平均: {desc['mean']:.2f}\n"
-        msg += f"- 最小: {desc['min']:.2f}\n"
-        msg += f"- 最大: {desc['max']:.2f}\n"
+        text_msg = f"【{column_name} の統計】\n"
+        text_msg += f"- 件数: {desc['count']}\n"
+        text_msg += f"- 平均: {desc['mean']:.2f}\n"
+        text_msg += f"- 最小: {desc['min']:.2f}\n"
+        text_msg += f"- 最大: {desc['max']:.2f}\n"
         counts = pd.cut(series, bins=5).value_counts().sort_index()
         labels = [str(interval) for interval in counts.index]
     else:
         counts = series.value_counts()
-        msg = f"【{column_name} の回答分布】\n"
+        text_msg = f"【{column_name} の回答分布】\n"
         for idx, val in counts.items():
-            msg += f"- {idx}: {val} 件\n"
+            text_msg += f"- {idx}: {val} 件\n"
         labels = counts.index.astype(str)
 
-    # グラフ
     fig, ax = plt.subplots(figsize=(4,3))
     colors = plt.cm.Blues(np.linspace(0.3, 0.9, len(counts)))
     ax.bar(range(len(counts)), counts.values, color=colors, edgecolor="white")
@@ -252,7 +249,7 @@ def get_distribution_and_chart(df_in, column_name: str):
     ax.set_xticklabels(labels, rotation=45, ha="right")
     ax.set_title(column_name)
     ax.set_ylabel("件数")
-    ax.grid(axis='y', color='gray', linestyle='--', linewidth=0.5, alpha=0.3)
+    ax.grid(axis="y", color="gray", linestyle="--", linewidth=0.5, alpha=0.3)
 
     plt.tight_layout()
     buf = io.BytesIO()
@@ -261,21 +258,22 @@ def get_distribution_and_chart(df_in, column_name: str):
     chart_b64 = base64.b64encode(buf.read()).decode("utf-8")
     plt.close(fig)
 
-    return msg, chart_b64
+    return text_msg, chart_b64
 
-#######################
-# (J) Flaskエンドポイント
-#######################
+##################
+# 9) Flask ルート
+##################
 @app.route("/")
 def index():
-    return "Hello from Chat - final improved version"
+    return "Hello from Chat - see /chat"
 
 @app.route("/ask", methods=["POST"])
 def ask():
     data = request.json
     user_text = data.get("question", "").strip()
+
+    # 入力が空
     if not user_text:
-        # 入力が空 -> ガイド
         return jsonify({
             "answer": "何について知りたいですか？\n" + get_guide_message(),
             "image": None
@@ -284,41 +282,44 @@ def ask():
     filter_dict, target_col = parse_conditions(user_text)
     filtered_df = apply_filters(df, filter_dict)
 
-    # フィルタ0件 & ターゲット1つでも見つかったら「そのカラムの全データ」を表示
+    # フィルタ0個: target_colがあれば全データのグラフ
     if len(filter_dict) == 0:
-        # もし target_col があり、かつ df にあるなら
         if target_col in df.columns:
-            # 全データを可視化
             msg, chart = get_distribution_and_chart(df, target_col)
-            # ここではあえて "ガイド" ではなく、結果だけ返す
-            return jsonify({"answer": msg, "image": chart})
+            return jsonify({"answer": "（列条件なし）\n" + msg, "image": chart})
         else:
-            # どの列も見つからなければガイド
+            # どの列にも該当しない→ガイド
             return jsonify({
-                "answer": "どの列も指定がないか、わかりませんでした。\n" + get_guide_message(),
+                "answer": "列を認識できませんでした。\n" + get_guide_message(),
                 "image": None
             })
 
-    # フィルタ後データが0件
+    # フィルタ後0件
     if len(filtered_df) == 0:
         return jsonify({
             "answer": "条件に合うデータがありませんでした。\n" + get_guide_message(),
             "image": None
         })
 
-    # ターゲット列存在しない
+    # ターゲット列が実在しない
     if target_col not in df.columns:
         return jsonify({
             "answer": "グラフ化する列がわかりませんでした。\n" + get_guide_message(),
             "image": None
         })
 
-    # グラフ生成
-    msg, chart_b64 = get_distribution_and_chart(filtered_df, target_col)
-    return jsonify({"answer": msg, "image": chart_b64})
+    msg, chart = get_distribution_and_chart(filtered_df, target_col)
+    return jsonify({"answer": msg, "image": chart})
 
+
+##################
+# 10) チャット画面
+##################
 @app.route("/chat")
 def chat():
+    """
+    - 初回ロード時にガイドを自動送信する例
+    """
     return """
 <!DOCTYPE html>
 <html lang="ja">
@@ -343,11 +344,13 @@ def chat():
     .msg-ai { text-align: left; margin: 5px; }
     .bubble-user {
       display: inline-block; background-color: #DCF8C6;
-      padding: 5px 10px; border-radius: 8px; max-width: 70%; word-wrap: break-word;
+      padding: 5px 10px; border-radius: 8px;
+      max-width: 70%; word-wrap: break-word;
     }
     .bubble-ai {
       display: inline-block; background-color: #E4E6EB;
-      padding: 5px 10px; border-radius: 8px; max-width: 70%; word-wrap: break-word;
+      padding: 5px 10px; border-radius: 8px;
+      max-width: 70%; word-wrap: break-word;
     }
     img {
       max-width: 100%;
@@ -365,20 +368,33 @@ def chat():
     }
   </style>
 </head>
-<body>
-  <h1>アンケート分析チャット ver:250108_3</h1>
+<body onload="initChat()">
+  <h1>アンケート分析チャット ver:250108_4</h1>
   <div id="chatArea"></div>
   <div>
     <input type="text" id="question" placeholder="質問を入力" style="width:70%;" />
     <button onclick="sendMessage()">送信</button>
   </div>
 
+  <!-- モーダル -->
   <div id="imgModal" onclick="closeModal()">
     <img id="imgModalContent">
   </div>
 
   <script>
     let messages = [];
+
+    // 初期ガイドを表示
+    function initChat() {
+      const welcome = "(初期ガイド)\\n" + 
+`""" + get_guide_message().replace("\n", "\\n") + """`;
+      messages.push({
+        role: "assistant",
+        content: welcome,
+        image: null
+      });
+      renderMessages();
+    }
 
     function renderMessages() {
       const chatArea = document.getElementById('chatArea');
@@ -388,22 +404,20 @@ def chat():
           chatArea.innerHTML += `
             <div class="msg-user">
               <div class="bubble-user">${msg.content}</div>
-            </div>
-          `;
+            </div>`;
         } else {
           let imageTag = "";
           if (msg.image) {
             imageTag = '<img src="data:image/png;base64,' + msg.image + '" alt="chart" onclick="enlargeImage(this)" />';
           }
-          const contentHtml = (msg.content || "").replace(/\\n/g, "<br/>");
+          let contentHtml = (msg.content || "").replace(/\\n/g, "<br/>");
           chatArea.innerHTML += `
             <div class="msg-ai">
               <div class="bubble-ai">
                 ${contentHtml}
                 ${imageTag}
               </div>
-            </div>
-          `;
+            </div>`;
         }
       });
       chatArea.scrollTop = chatArea.scrollHeight;
