@@ -7,43 +7,79 @@ import pandas as pd
 import matplotlib
 matplotlib.use('Agg')  # サーバー上でmatplotlibを使うため
 import matplotlib.pyplot as plt
+import matplotlib.font_manager as fm
 
 from difflib import SequenceMatcher
 from flask import Flask, request, jsonify
 
-# =====================
-# 日本語フォント設定（文字化け対策）
-# =====================
-# 環境に合わせてインストール済みのフォントを優先リストに追加
-plt.rcParams["font.sans-serif"] = ["Noto Sans CJK JP", "IPAexGothic", "Meiryo", "Hiragino Sans", "sans-serif"]
-plt.rcParams["font.family"] = "sans-serif"
+# =====================================
+# 1) 日本語フォントをサーバーサイドで強制指定
+# =====================================
+# 例: Noto Sans CJK (Ubuntu系でインストール済み想定)
+font_path = "/usr/share/fonts/truetype/noto/NotoSansCJK-Regular.ttc"
+if os.path.exists(font_path):
+    font_prop = fm.FontProperties(fname=font_path)
+    plt.rcParams["font.family"] = font_prop.get_name()
+    print("Using font:", font_prop.get_name())
+else:
+    plt.rcParams["font.family"] = "sans-serif"
+    print("Warning: custom font not found. Using sans-serif.")
 
-# Flaskアプリ
+
 app = Flask(__name__)
 
 # ===== CSV読み込み =====
 CSV_PATH = os.path.join(os.path.dirname(__file__), "data", "survey_data.csv")
 if os.path.exists(CSV_PATH):
-    # encoding を明示
     df = pd.read_csv(CSV_PATH, encoding="utf-8")
     print("CSV loaded:", CSV_PATH)
 else:
-    print("CSV not found. Using demo data.")
+    # CSVが無い場合デモ用
     df = pd.DataFrame({
-        "Q1 (安全装備パッケージ)": ["BASIC", "STANDARD", "ADVANCE", "BASIC", "PREMIUM"],
-        "Q2 (荷台形状)": ["バン/ウィング", "平ボディ", "平ボディ", "ダンプ", "温度管理車"],
-        "Q3 (稼働日数)": ["5日", "5日", "6日", "7日", "3~4日"],
-        "Q4 (稼働時間)": ["4h~8h", "4h~8h", "8h~12h", "8h~12h", "4h~8h"],
-        "Q5 (休憩時間)": ["1h未満", "3h~5h", "3h~5h", "1h未満", "5h以上"],
-        "Q6 (走行距離)": ["100km~250km", "100km未満", "500km以上", "250km~500km", "100km~250km"],
-        "Q7 (燃費(km/L))": [10.5, 12.3, 9.8, 15.0, 7.6],
+        "安全装備パッケージ": ["STANDARD", "PREMIUM", "BASIC", "ADVANCE"],
+        "荷台形状": ["ミキサ", "ダンプ", "その他", "バン/ウィング"],
+        "稼働日数": ["5日", "2日以下", "7日", "3～4日"],
+        # ...以下省略...
     })
-
+    print("CSV not found. Using small demo data.")
 print("Columns:", df.columns.tolist())
 
-# ===== ファジーマッチ =====
+# =====================================
+# 2) 稼働日数などを数値化するヘルパー
+# =====================================
+def parse_kadou_nissu(s):
+    """'7日', '3～4日', '2日以下' などを数値化するサンプル."""
+    if not isinstance(s, str):
+        return None
+
+    # 2日以下
+    m_le = re.match(r"(\d+)日以下", s)
+    if m_le:
+        # "2日以下" -> 2 という数字を返す(「以下」はどう扱うか要相談)
+        return float(m_le.group(1))
+
+    # "3～4日" -> 平均 (3+4)/2
+    m_range = re.match(r"(\d+)～(\d+)日", s)
+    if m_range:
+        start = float(m_range.group(1))
+        end = float(m_range.group(2))
+        return (start + end) / 2
+
+    # "5日", "7日" など
+    m_single = re.match(r"(\d+)日", s)
+    if m_single:
+        return float(m_single.group(1))
+
+    return None
+
+# 稼働日数を「稼働日数_num」みたいな列に追加する
+if "稼働日数" in df.columns:
+    df["稼働日数_num"] = df["稼働日数"].apply(parse_kadou_nissu)
+
+# =====================================
+# 3) ファジーマッチで列を特定
+# =====================================
 def normalize_str(s: str) -> str:
-    """小文字化＋カッコや空白除去"""
     s = s.lower()
     s = re.sub(r"[()\s（）]", "", s)
     return s
@@ -52,10 +88,6 @@ def calc_similarity(a: str, b: str) -> float:
     return SequenceMatcher(None, normalize_str(a), normalize_str(b)).ratio()
 
 def find_best_column(user_text: str, threshold=0.4):
-    """
-    df.columns の中で最も類似度が高い列名を返す。
-    threshold未満なら None。
-    """
     best_score = 0.0
     best_col = None
     for col in df.columns:
@@ -67,149 +99,125 @@ def find_best_column(user_text: str, threshold=0.4):
         return None
     return best_col
 
-# ===== 条件解析用の簡易パーサ =====
+# =====================================
+# 4) ユーザ入力から複数条件をパース
+# =====================================
 def parse_conditions(user_text: str):
     """
-    ユーザテキストから
-    - フィルタ条件: {列名: (op, value)} の辞書
-    - 最終的に集計・可視化したい列 (target_col)
-    を抽出する簡易実装の例。
-    
-    例: 「荷台形状のミキサで稼働日数が5日以上の安全装備パッケージのグラフ」
-     -> {
-          "Q2 (荷台形状)": ("==", "ミキサ"),
-          "Q3 (稼働日数)": (">=", "5日")
-        }, target_col = "Q1 (安全装備パッケージ)"
+    例: 「荷台形状のミキサ で 稼働日数が5日以上 の 安全装備パッケージ のグラフを作成」
+     -> filter_dict = {
+          '荷台形状': ('==', 'ミキサ'),
+          '稼働日数': ('>=', '5日')
+        }, target_col = "安全装備パッケージ"
     """
-
-    # まず全列名(日本語部分含む)をファジーマッチ用にリスト化
-    col_candidates = [c for c in df.columns]
-
     filter_dict = {}
     target_col = None
 
-    # 分かりやすくするため「○○以上」「○○以下」は正規表現で捉える例
-    # 厳密な実装はデータの形式次第で要カスタム
     pattern_ge = re.compile(r"(\d+)日以上")
     pattern_le = re.compile(r"(\d+)日以下")
     pattern_eq_day = re.compile(r"(\d+)日")
 
-    # テキストをスペース区切りでスキャン(超簡易)
     tokens = user_text.split()
-
-    # すべてのトークンをざっくり見て、
-    # 1) カラム名っぽいもの
-    # 2) その後の条件(以上, 以下, 完全一致 など)
-    # を推定する例
     col_in_focus = None
     for t in tokens:
-        # まずはファジーマッチで列候補を探す
-        col_found = find_best_column(t)
-        if col_found:
-            # 新規にカラムを認識したら、注目カラムにセット
-            col_in_focus = col_found
+        # 列名っぽいものを探す
+        c = find_best_column(t)
+        if c:
+            # 例: "荷台形状" にマッチしたらそこに条件をつける想定
+            col_in_focus = c
             continue
-        
-        # カラムが確定している状態で、その条件を拾う
+
+        # もし列が確定しているなら、その後に来る文字列を条件とみなす
         if col_in_focus:
-            # 例: 「ミキサ」「バン/ウィング」など文字列一致
-            #     「5日以上」「3日以下」「5日」など
             m_ge = pattern_ge.search(t)
             m_le = pattern_le.search(t)
             m_eq = pattern_eq_day.search(t)
 
             if m_ge:
-                val = m_ge.group(1) + "日"  # "5日" など
+                val = m_ge.group(1) + "日"
                 filter_dict[col_in_focus] = (">=", val)
                 col_in_focus = None
             elif m_le:
+                # 2日以下 などは CSV にそのまま "2日以下" と書いてある場合もある
                 val = m_le.group(1) + "日"
                 filter_dict[col_in_focus] = ("<=", val)
                 col_in_focus = None
             elif m_eq:
-                # もし「◯日以上」「◯日以下」にマッチしなかったら
-                # いったん「==」とみなす
-                val = m_eq.group(1) + "日"
-                filter_dict[col_in_focus] = ("==", val)
+                # 5日 など
+                filter_dict[col_in_focus] = ("==", m_eq.group(1) + "日")
                 col_in_focus = None
             else:
-                # 日数以外(文字列)はそのまま "==" 扱いにする(ざっくり)
-                # 例えば "ミキサ" "平ボディ" "BASIC" など
+                # 普通の文字列
+                # ex: ミキサ, ダンプ, 車載車...
                 filter_dict[col_in_focus] = ("==", t)
                 col_in_focus = None
 
-    # 最後に「○○のグラフ」っぽいところから target_col を推定
-    # 今回は非常に大雑把に、文末付近に再度登場したカラム名をターゲットとみなす
-    # 例: 「○○で ×× の グラフ」→ ×× をターゲット
-    possible_target = None
-    # 文末付近の単語からカラムっぽいものを探索
+    # 文末付近に再登場する列名をターゲット列とみなす (超簡易)
     for t in reversed(tokens):
         c = find_best_column(t)
         if c:
-            possible_target = c
+            target_col = c
             break
 
-    if possible_target is not None:
-        target_col = possible_target
-    else:
-        # もし特定できなければ適当にQ1をデフォルトターゲットに
-        target_col = "Q1 (安全装備パッケージ)"
+    # 見つからなければデフォルト
+    if not target_col:
+        target_col = "安全装備パッケージ"
 
     return filter_dict, target_col
 
-def apply_filters(df: pd.DataFrame, filter_dict: dict):
-    """
-    parse_conditions で抽出したフィルタ辞書を使い、
-    データフレームを絞り込む
-    """
-    filtered_df = df.copy()
+# =====================================
+# 5) フィルタ適用
+# =====================================
+def apply_filters(df_in: pd.DataFrame, filter_dict: dict):
+    filtered = df_in.copy()
     for col, (op, val) in filter_dict.items():
-        # 対象カラムが文字列なら単純一致/含む など好きに
-        # 例: 日数カラムが "5日", "3~4日" などの場合、
-        #     "5日以上" -> "5日" or "6日" or "7日" ... のように本当は細かい変換要
-        #     ここではサンプルとして "5日" を含むかどうかで判定してみる例
-        if col not in filtered_df.columns:
+        if col not in filtered.columns:
             continue
-        
-        # 数値カラムの場合
-        if filtered_df[col].dtype in [int, float]:
-            # 数値として比較する例(必要に応じて変換等)
-            try:
-                val_num = float(re.findall(r"(\d+\.?\d*)", val)[0])
-            except:
-                val_num = None
 
-            if val_num is not None:
+        # 稼働日数など数値比較が必要なら、対応する数値列を使う
+        # 例: "稼働日数" なら "稼働日数_num" に置き換える
+        use_col = col
+        if col == "稼働日数" and "稼働日数_num" in filtered.columns:
+            use_col = "稼働日数_num"
+
+        # 数値列なら数値比較
+        if filtered[use_col].dtype in [int, float]:
+            # val から数字を取り出す
+            # 例: "5日" -> 5
+            m_num = re.search(r"(\d+)", val)
+            if m_num:
+                vnum = float(m_num.group(1))
                 if op == ">=":
-                    filtered_df = filtered_df[filtered_df[col] >= val_num]
+                    filtered = filtered[filtered[use_col] >= vnum]
                 elif op == "<=":
-                    filtered_df = filtered_df[filtered_df[col] <= val_num]
+                    filtered = filtered[use_col] <= vnum
+                    filtered = filtered[filtered[use_col] <= vnum]
                 elif op == "==":
-                    filtered_df = filtered_df[filtered_df[col] == val_num]
+                    filtered = filtered[filtered[use_col] == vnum]
         else:
-            # 文字列カラムの場合
+            # 文字列比較(部分一致 or 完全一致)
+            # ここでは簡易的に「==」を「.str.contains(val)」で実装
             if op == "==":
-                # 例: 単純に "val を含む" として絞る
-                #     （完全一致にしたいなら == val）
-                filtered_df = filtered_df[filtered_df[col].astype(str).str.contains(val)]
+                filtered = filtered[filtered[col].astype(str).str.contains(val)]
             elif op == ">=":
-                # "5日以上" のように文字列同士で大小比較は普通できないので、
-                # 日数だけ特別処理など要実装
-                # ここは簡易例なので「val を含む行とみなす」という雑実装
-                filtered_df = filtered_df[filtered_df[col].astype(str).str.contains(val)]
+                # "5日以上" → CSV に実際 "5日" と書いてあれば拾うが
+                # "6日" "7日" は別表記なので注意。数値列でやるべき
+                # ここでは一応 partial match
+                filtered = filtered[filtered[col].astype(str).str.contains(val)]
             elif op == "<=":
-                # 同様に雑実装
-                filtered_df = filtered_df[~filtered_df[col].astype(str).str.contains(val)]
+                # "2日以下" → CSV に "2日以下" と書いてあれば拾う
+                filtered = filtered[filtered[col].astype(str).str.contains(val)]
 
-    return filtered_df
+    return filtered
 
-# ===== データ集計＋グラフ生成 =====
-def get_distribution_and_chart(df: pd.DataFrame, column_name: str):
-    """指定カラムの分布or統計を返し、バーを同系色(Blues)で表示。グリッドも薄く。"""
-    if column_name not in df.columns:
+# =====================================
+# 6) グラフ生成
+# =====================================
+def get_distribution_and_chart(df_in, column_name):
+    if column_name not in df_in.columns:
         return f"列 '{column_name}' は存在しません。", None
 
-    series = df[column_name]
+    series = df_in[column_name]
     if series.dtype in [float, int]:
         desc = series.describe()
         text_msg = f"【{column_name} の統計】\n"
@@ -226,84 +234,53 @@ def get_distribution_and_chart(df: pd.DataFrame, column_name: str):
             text_msg += f"- {idx}: {val} 件\n"
         labels = counts.index.astype(str)
 
-    # グラフ生成
-    fig, ax = plt.subplots(figsize=(4,3))
+    fig, ax = plt.subplots(figsize=(5,3))
     n = len(counts)
-    # Bluesカラーマップを使用
-    colors = plt.cm.Blues(np.linspace(0.3, 0.9, n))  # 0.3~0.9の範囲で濃淡
+    colors = plt.cm.Blues(np.linspace(0.3, 0.9, n))
     ax.bar(range(n), counts.values, color=colors, edgecolor="white")
     ax.set_xticks(range(n))
     ax.set_xticklabels(labels, rotation=45, ha="right")
     ax.set_title(column_name)
     ax.set_ylabel("件数")
-
-    # グリッドを薄く引く
     ax.grid(axis="y", color="gray", linestyle="--", linewidth=0.5, alpha=0.3)
-
     plt.tight_layout()
+
     buf = io.BytesIO()
     plt.savefig(buf, format="png")
     buf.seek(0)
-    chart_base64 = base64.b64encode(buf.read()).decode("utf-8")
+    chart_b64 = base64.b64encode(buf.read()).decode("utf-8")
     plt.close(fig)
 
-    return text_msg, chart_base64
+    return text_msg, chart_b64
 
-# Flask ルート
+
 @app.route("/")
 def index():
     return "Hello from Chat - with colorful bars & grid"
 
+
 @app.route("/ask", methods=["POST"])
 def ask():
-    """
-    POST { "question": "安全装備" } など
-    1) ユーザ入力の解析（複数条件＆ターゲットカラム）
-    2) データをフィルタ
-    3) ターゲットカラムを集計＆グラフ
-    4) なければ、曖昧メッセージ
-    """
     data = request.json
     user_text = data.get("question", "").strip()
-
     if not user_text:
         return jsonify({"answer": "何について知りたいですか？", "image": None})
 
-    # --- ここで複数条件を解析 ---
+    # 1) 複数条件を解析
     filter_dict, target_col = parse_conditions(user_text)
-
-    # --- フィルタ適用 ---
+    # 2) データをフィルタ
     filtered_df = apply_filters(df, filter_dict)
 
     if len(filtered_df) == 0:
-        # フィルタの結果が0件ならメッセージ
-        return jsonify({
-            "answer": "条件に合うデータがありませんでした。",
-            "image": None
-        })
+        return jsonify({"answer": "条件に合うデータがありませんでした。", "image": None})
 
-    # --- ターゲット列で集計＆グラフ生成 ---
-    if target_col:
-        text_msg, chart_b64 = get_distribution_and_chart(filtered_df, target_col)
-        return jsonify({"answer": text_msg, "image": chart_b64})
-    else:
-        # ターゲット列が見つからなかった場合のフォールバック
-        fallback_msg = """質問がわからなかったです。以下のどれかを含む文言でもう一度質問してください。
-- Q1(安全装備パッケージ)
-- Q2(荷台形状)
-- Q3(稼働日数)
-- Q4(稼働時間)
-- Q5(休憩時間)
-- Q6(走行距離)
-- Q7(燃費)
-"""
-        return jsonify({"answer": fallback_msg, "image": None})
+    # 3) ターゲット列で集計＆グラフ
+    text_msg, chart_b64 = get_distribution_and_chart(filtered_df, target_col)
+    return jsonify({"answer": text_msg, "image": chart_b64})
+
 
 @app.route("/chat")
 def chat():
-    """
-    HTML: チャットUI (h1フォントを18px, グラフクリックで拡大)
-    """
     return """
 <!DOCTYPE html>
 <html lang="ja">
@@ -311,25 +288,27 @@ def chat():
   <meta charset="UTF-8">
   <title>アンケート分析チャット</title>
   <meta name="viewport" content="width=device-width, initial-scale=1.0"/>
+  <link rel="preconnect" href="https://fonts.googleapis.com">
+  <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+  <!-- これらはあくまでHTML上のwebフォント; matplotlibには反映されない -->
+  <link href="https://fonts.googleapis.com/css2?family=Noto+Sans+JP:wght@100..900&display=swap" rel="stylesheet">
   <style>
     body {
-      font-family: sans-serif; margin: 20px;
+      /* WebフォントをHTMLに適用 (matplotlib画像には適用されない) */
+      font-family: 'Noto Sans JP', sans-serif; 
+      margin: 20px;
     }
-    h1 {
-      font-size: 18px; /* タイトルっぽく */
-    }
+    h1 { font-size: 18px; }
     #chatArea {
       border: 1px solid #ccc;
-      width: 80vw;
-      height: 65vh;
+      width: 80vw; height: 65vh;
       max-width: 1000px;
       margin-bottom: 10px;
       overflow-y: auto;
     }
     @media (min-width: 1024px) {
       #chatArea {
-        width: 60vw;
-        height: 70vh;
+        width: 60vw; height: 70vh;
       }
     }
     .msg-user {
@@ -360,11 +339,11 @@ def chat():
       max-width: 100%;
       display: block;
       margin-top: 5px;
-      cursor: pointer; /* クリック可能にする */
+      cursor: pointer; /* クリック拡大 */
     }
     /* 拡大表示用モーダル */
     #imgModal {
-      display: none; /* 初期は非表示 */
+      display: none;
       position: fixed; 
       z-index: 9999;
       left: 0; top: 0;
@@ -379,14 +358,13 @@ def chat():
   </style>
 </head>
 <body>
-  <h1>アンケート分析チャット</h1>
+  <h1>アンケート分析チャット Version：25/1/07</h1>
   <div id="chatArea"></div>
   <div>
     <input type="text" id="question" placeholder="質問を入力" style="width:70%;" />
     <button onclick="sendMessage()">送信</button>
   </div>
 
-  <!-- 画像拡大用モーダル -->
   <div id="imgModal" onclick="closeModal()">
     <img id="imgModalContent">
   </div>
@@ -445,7 +423,6 @@ def chat():
       renderMessages();
     }
 
-    // 画像クリックでモーダル拡大
     function enlargeImage(img) {
       const modal = document.getElementById("imgModal");
       const modalContent = document.getElementById("imgModalContent");
@@ -453,8 +430,7 @@ def chat():
       modal.style.display = "block";
     }
     function closeModal() {
-      const modal = document.getElementById("imgModal");
-      modal.style.display = "none";
+      document.getElementById("imgModal").style.display = "none";
     }
   </script>
 </body>
