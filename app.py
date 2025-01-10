@@ -1,392 +1,463 @@
 import os
+import re
 import io
 import base64
-import json
-
-from flask import Flask, request, jsonify, render_template_string
-import openai  # azure-openai ではなく、場合により azure-openai ライブラリを使う場合も
+import numpy as np
 import pandas as pd
 import matplotlib
-matplotlib.use('Agg')  # サーバーサイドで描画するため
+matplotlib.use('Agg')
 import matplotlib.pyplot as plt
+import matplotlib.font_manager as fm
 
-# --------------------------------
-# Flaskアプリ設定
-# --------------------------------
+from difflib import SequenceMatcher
+from flask import Flask, request, jsonify
+
+##################
+# Flask App
+##################
 app = Flask(__name__)
 
-# ◆Azure OpenAI のエンドポイント・キー設定
-#   実際には Render の環境変数などで設定するほうが安全です
-#   Azureの場合、APIベースURLが通常のOpenAIと異なる
-#   例: "https://<your-resource-name>.openai.azure.com/"
-openai.api_type = "azure"
-openai.api_base = os.environ.get("OPENAI_API_BASE", "https://<YOUR-AZURE-RESOURCE-NAME>.openai.azure.com/")
-openai.api_version = "2023-07-01-preview"
-openai.api_key = os.environ.get("OPENAI_API_KEY", "<YOUR-AZURE-OPENAI-KEY>")
+##################
+# 1) フォント設定
+##################
+local_font_path = os.path.join(os.path.dirname(__file__), "font", "NotoSansJP.ttf")
+if os.path.exists(local_font_path):
+    try:
+        # font_managerを使って fontProp 作成
+        font_prop = fm.FontProperties(fname=local_font_path)
+        # キャッシュ再構築
+        fm._rebuild()
+        # rcParams にセット
+        plt.rcParams["font.family"] = font_prop.get_name()
+        print("Using local font:", font_prop.get_name())
+    except Exception as e:
+        print("Error loading font:", e)
+        plt.rcParams["font.family"] = "sans-serif"
+else:
+    print("Warning: NotoSansJP.ttf not found. Fallback to sans-serif.")
+    plt.rcParams["font.family"] = "sans-serif"
 
-# --------------------------------
-# 簡易UI用のHTML（本格的なフロントは別ファイルでもOK）
-# --------------------------------
-# 画面の仕様：PCは幅800px中央、SPはフルサイズ、入力はフッター固定
-# ここでは超簡易的にHTMLを返す例
-HTML_TEMPLATE = """
+##################
+# 2) CSV読み込み
+##################
+CSV_PATH = os.path.join(os.path.dirname(__file__), "data", "survey_data.csv")
+if os.path.exists(CSV_PATH):
+    df = pd.read_csv(CSV_PATH, encoding="utf-8")
+    print("CSV loaded:", CSV_PATH)
+else:
+    # デモデータ
+    df = pd.DataFrame({
+        "安全装備パッケージ": ["STANDARD", "PREMIUM", "ADVANCE", "BASIC", "PREMIUM"],
+        "荷台形状": ["ミキサ", "ダンプ", "温度管理車", "バン/ウィング", "ミキサ"],
+        "稼働日数": ["5日", "2日以下", "7日", "3～4日", "6日"],
+    })
+    print("CSV not found, using demo data.")
+
+print("CSV columns:", df.columns.tolist())
+
+##################
+# 3) 稼働日数の数値化
+##################
+def parse_kadou_nissu(s):
+    if not isinstance(s, str):
+        return None
+    m_le = re.match(r"(\d+)日以下", s)
+    if m_le:
+        return float(m_le.group(1))
+    m_range = re.match(r"(\d+)～(\d+)日", s)
+    if m_range:
+        start = float(m_range.group(1))
+        end = float(m_range.group(2))
+        return (start + end)/2
+    m_single = re.match(r"(\d+)日", s)
+    if m_single:
+        return float(m_single.group(1))
+    return None
+
+if "稼働日数" in df.columns:
+    df["稼働日数_num"] = df["稼働日数"].apply(parse_kadou_nissu)
+
+##################
+# 4) ファジーマッチ
+##################
+def normalize_str(s: str) -> str:
+    s = s.lower()
+    s = re.sub(r"[()\s（）]", "", s)
+    return s
+
+def calc_similarity(a: str, b: str) -> float:
+    return SequenceMatcher(None, normalize_str(a), normalize_str(b)).ratio()
+
+def find_best_column(user_text: str, threshold=0.5):
+    """
+    threshold=0.5 に設定。
+    「あ」 -> 類似度が低すぎ -> None
+    「荷台形状」 -> ある程度合致。
+    """
+    best_score = 0.0
+    best_col = None
+    for col in df.columns:
+        score = calc_similarity(user_text, col)
+        if score > best_score:
+            best_score = score
+            best_col = col
+    # print(f"[DEBUG] {user_text} -> best:{best_col} score:{best_score}")
+    if best_score < threshold:
+        return None
+    return best_col
+
+##################
+# 5) ガイドメッセージ
+##################
+def get_guide_message():
+    guide_text = """【ガイド】
+以下のように質問してみてください:
+- 「安全装備パッケージがSTANDARD」
+- 「荷台形状がミキサ」
+- 「稼働日数が5日以上」
+- 「荷台形状がダンプ の 安全装備パッケージ」
+(複数条件は「の」で区切り)
+
+使用可能な列:
+"""
+    for c in df.columns:
+        guide_text += f"- {c}\n"
+    return guide_text
+
+##################
+# 6) 条件解析
+##################
+def parse_conditions(user_text: str):
+    # 助詞除去
+    user_text = user_text.replace("のグラフ", "")
+    user_text = re.sub(r"[のでをにはが]", " ", user_text)
+    user_text = re.sub(r"\s+", " ", user_text).strip()
+
+    filter_dict = {}
+    target_col = None
+
+    pat_ge = re.compile(r"(\d+)日以上")
+    pat_le = re.compile(r"(\d+)日以下")
+    pat_eq = re.compile(r"(\d+)日")
+
+    tokens = user_text.split()
+    col_in_focus = None
+
+    for t in tokens:
+        c = find_best_column(t)
+        if c:
+            col_in_focus = c
+            continue
+
+        if col_in_focus:
+            m_ge = pat_ge.search(t)
+            m_le = pat_le.search(t)
+            m_eq_ = pat_eq.search(t)
+
+            if m_ge:
+                val = m_ge.group(1) + "日"
+                filter_dict[col_in_focus] = (">=", val)
+                col_in_focus = None
+            elif m_le:
+                val = m_le.group(1) + "日"
+                filter_dict[col_in_focus] = ("<=", val)
+                col_in_focus = None
+            elif m_eq_:
+                val = m_eq_.group(1) + "日"
+                filter_dict[col_in_focus] = ("==", val)
+                col_in_focus = None
+            else:
+                # 文字
+                filter_dict[col_in_focus] = ("==", t)
+                col_in_focus = None
+
+    # 文末付近でターゲット列を探す
+    for t in reversed(tokens):
+        c = find_best_column(t)
+        if c:
+            target_col = c
+            break
+
+    if not target_col:
+        target_col = df.columns[0]
+
+    return filter_dict, target_col
+
+##################
+# 7) フィルタ適用
+##################
+def apply_filters(df_in: pd.DataFrame, filter_dict: dict):
+    filtered = df_in.copy()
+
+    for col, (op, val) in filter_dict.items():
+        if col not in filtered.columns:
+            continue
+
+        if col == "稼働日数" and "稼働日数_num" in filtered.columns:
+            # 数値比較
+            m_num = re.search(r"(\d+)", val)
+            if m_num:
+                v = float(m_num.group(1))
+                if op == ">=":
+                    filtered = filtered[filtered["稼働日数_num"] >= v]
+                elif op == "<=":
+                    filtered = filtered[filtered["稼働日数_num"] <= v]
+                elif op == "==":
+                    filtered = filtered[filtered["稼働日数_num"] == v]
+        else:
+            # 文字列部分一致
+            if op == "==":
+                filtered = filtered[filtered[col].astype(str).str.contains(val)]
+            elif op == ">=":
+                filtered = filtered[filtered[col].astype(str).str.contains(val)]
+            elif op == "<=":
+                filtered = filtered[filtered[col].astype(str).str.contains(val)]
+
+    return filtered
+
+##################
+# 8) グラフ生成
+##################
+def get_distribution_and_chart(df_in: pd.DataFrame, column_name: str):
+    if column_name not in df_in.columns:
+        return f"列 '{column_name}' は存在しません。", None
+
+    series = df_in[column_name]
+    if len(series) == 0:
+        return f"列 '{column_name}' にデータがありません。", None
+
+    if series.dtype in [int, float]:
+        desc = series.describe()
+        text_msg = f"【{column_name} の統計】\n"
+        text_msg += f"- 件数: {desc['count']}\n"
+        text_msg += f"- 平均: {desc['mean']:.2f}\n"
+        text_msg += f"- 最小: {desc['min']:.2f}\n"
+        text_msg += f"- 最大: {desc['max']:.2f}\n"
+        counts = pd.cut(series, bins=5).value_counts().sort_index()
+        labels = [str(interval) for interval in counts.index]
+    else:
+        counts = series.value_counts()
+        text_msg = f"【{column_name} の回答分布】\n"
+        for idx, val in counts.items():
+            text_msg += f"- {idx}: {val} 件\n"
+        labels = counts.index.astype(str)
+
+    fig, ax = plt.subplots(figsize=(4,3))
+    colors = plt.cm.Blues(np.linspace(0.3, 0.9, len(counts)))
+    ax.bar(range(len(counts)), counts.values, color=colors, edgecolor="white")
+    ax.set_xticks(range(len(counts)))
+    ax.set_xticklabels(labels, rotation=45, ha="right")
+    ax.set_title(column_name)
+    ax.set_ylabel("件数")
+    ax.grid(axis="y", color="gray", linestyle="--", linewidth=0.5, alpha=0.3)
+
+    plt.tight_layout()
+    buf = io.BytesIO()
+    plt.savefig(buf, format="png")
+    buf.seek(0)
+    chart_b64 = base64.b64encode(buf.read()).decode("utf-8")
+    plt.close(fig)
+
+    return text_msg, chart_b64
+
+##################
+# 9) Flask ルート
+##################
+@app.route("/")
+def index():
+    return "Hello from Chat - see /chat"
+
+@app.route("/ask", methods=["POST"])
+def ask():
+    data = request.json
+    user_text = data.get("question", "").strip()
+
+    # 入力が空
+    if not user_text:
+        return jsonify({
+            "answer": "何について知りたいですか？\n" + get_guide_message(),
+            "image": None
+        })
+
+    filter_dict, target_col = parse_conditions(user_text)
+    filtered_df = apply_filters(df, filter_dict)
+
+    # フィルタ0個: target_colがあれば全データのグラフ
+    if len(filter_dict) == 0:
+        if target_col in df.columns:
+            msg, chart = get_distribution_and_chart(df, target_col)
+            return jsonify({"answer": "（列条件なし）\n" + msg, "image": chart})
+        else:
+            # どの列にも該当しない→ガイド
+            return jsonify({
+                "answer": "列を認識できませんでした。\n" + get_guide_message(),
+                "image": None
+            })
+
+    # フィルタ後0件
+    if len(filtered_df) == 0:
+        return jsonify({
+            "answer": "条件に合うデータがありませんでした。\n" + get_guide_message(),
+            "image": None
+        })
+
+    # ターゲット列が実在しない
+    if target_col not in df.columns:
+        return jsonify({
+            "answer": "グラフ化する列がわかりませんでした。\n" + get_guide_message(),
+            "image": None
+        })
+
+    msg, chart = get_distribution_and_chart(filtered_df, target_col)
+    return jsonify({"answer": msg, "image": chart})
+
+
+##################
+# 10) チャット画面
+##################
+@app.route("/chat")
+def chat():
+    """
+    - 初回ロード時にガイドを自動送信する例
+    """
+    return """
 <!DOCTYPE html>
 <html lang="ja">
 <head>
-    <meta charset="UTF-8" />
-    <title>Azure OpenAI Chat (Render)</title>
-    <style>
-        body { margin:0; padding:0; font-family: sans-serif; }
-        .container {
-            max-width: 800px;
-            margin: 0 auto;
-            padding: 1em;
-        }
-        .chat-bubble {
-            border: 1px solid #ccc;
-            padding: 0.5em;
-            margin: 0.5em 0;
-            border-radius: 0.5em;
-        }
-        .user { background-color: #eef; }
-        .assistant { background-color: #efe; }
-        .footer-input {
-            position: fixed;
-            bottom: 0;
-            left: 0;
-            width: 100%;
-            background: #fafafa;
-            border-top: 1px solid #ccc;
-            padding: 0.5em;
-        }
-        .footer-input form {
-            display: flex;
-        }
-        .footer-input input[type='text'] {
-            flex: 1;
-            padding: 0.5em;
-            margin-right: 0.5em;
-        }
-    </style>
-</head>
-<body>
-<div class="container">
-    <h1>Azure OpenAI - アンケート結果可視化チャット</h1>
-    <div id="chat-box"></div>
-</div>
-<div class="footer-input">
-  <form id="chat-form">
-    <input type="text" id="user-input" placeholder="ここに入力..." />
-    <button type="submit">送信</button>
-  </form>
-</div>
-
-<script>
-const chatBox = document.getElementById("chat-box");
-const chatForm = document.getElementById("chat-form");
-const userInput = document.getElementById("user-input");
-
-chatForm.addEventListener("submit", async (e) => {
-    e.preventDefault();
-    let text = userInput.value.trim();
-    if(!text) return;
-    
-    // 画面にユーザー投稿を表示
-    appendMessage("user", text);
-    userInput.value = "";
-    
-    // サーバーにPOST
-    let res = await fetch("/chat", {
-        method: "POST",
-        headers: { "Content-Type":"application/json" },
-        body: JSON.stringify({ user_input: text })
-    });
-    let data = await res.json();
-    // data: { message, graph_base64? ... }
-    
-    appendMessage("assistant", data.message);
-    
-    if(data.graph_base64){
-        let img = document.createElement("img");
-        img.src = "data:image/png;base64," + data.graph_base64;
-        img.style.maxWidth = "100%";
-        chatBox.appendChild(img);
+  <meta charset="UTF-8">
+  <title>アンケート分析チャット</title>
+  <meta name="viewport" content="width=device-width, initial-scale=1.0"/>
+  <style>
+    body { font-family: sans-serif; margin: 20px; }
+    h1 { font-size: 18px; }
+    #chatArea {
+      border: 1px solid #ccc;
+      width: 80vw; height: 65vh;
+      max-width: 1000px;
+      margin-bottom: 10px;
+      overflow-y: auto;
     }
-});
+    @media (min-width: 1024px) {
+      #chatArea { width: 60vw; height: 70vh; }
+    }
+    .msg-user { text-align: right; margin: 5px; }
+    .msg-ai { text-align: left; margin: 5px; }
+    .bubble-user {
+      display: inline-block; background-color: #DCF8C6;
+      padding: 5px 10px; border-radius: 8px;
+      max-width: 70%; word-wrap: break-word;
+    }
+    .bubble-ai {
+      display: inline-block; background-color: #E4E6EB;
+      padding: 5px 10px; border-radius: 8px;
+      max-width: 70%; word-wrap: break-word;
+    }
+    img {
+      max-width: 100%;
+      display: block;
+      margin-top: 5px;
+      cursor: pointer;
+    }
+    #imgModal {
+      display: none;
+      position: fixed; z-index: 9999; left: 0; top: 0;
+      width: 100%; height: 100%; background-color: rgba(0,0,0,0.8);
+    }
+    #imgModalContent {
+      margin: 10% auto; display: block; max-width: 90%;
+    }
+  </style>
+</head>
+<body onload="initChat()">
+  <h1>アンケート分析チャット ver:250108_4</h1>
+  <div id="chatArea"></div>
+  <div>
+    <input type="text" id="question" placeholder="質問を入力" style="width:70%;" />
+    <button onclick="sendMessage()">送信</button>
+  </div>
 
-// チャットメッセージを追加表示する
-function appendMessage(role, content){
-    let div = document.createElement("div");
-    div.className = "chat-bubble " + role;
-    div.textContent = content;
-    chatBox.appendChild(div);
-    // スクロール位置を下へ
-    window.scrollTo(0, document.body.scrollHeight);
-}
-</script>
+  <!-- モーダル -->
+  <div id="imgModal" onclick="closeModal()">
+    <img id="imgModalContent">
+  </div>
+
+  <script>
+    let messages = [];
+
+    // 初期ガイドを表示
+    function initChat() {
+      const welcome = "(初期ガイド)\\n" + 
+`""" + get_guide_message().replace("\n", "\\n") + """`;
+      messages.push({
+        role: "assistant",
+        content: welcome,
+        image: null
+      });
+      renderMessages();
+    }
+
+    function renderMessages() {
+      const chatArea = document.getElementById('chatArea');
+      chatArea.innerHTML = "";
+      messages.forEach(msg => {
+        if (msg.role === "user") {
+          chatArea.innerHTML += `
+            <div class="msg-user">
+              <div class="bubble-user">${msg.content}</div>
+            </div>`;
+        } else {
+          let imageTag = "";
+          if (msg.image) {
+            imageTag = '<img src="data:image/png;base64,' + msg.image + '" alt="chart" onclick="enlargeImage(this)" />';
+          }
+          let contentHtml = (msg.content || "").replace(/\\n/g, "<br/>");
+          chatArea.innerHTML += `
+            <div class="msg-ai">
+              <div class="bubble-ai">
+                ${contentHtml}
+                ${imageTag}
+              </div>
+            </div>`;
+        }
+      });
+      chatArea.scrollTop = chatArea.scrollHeight;
+    }
+
+    async function sendMessage() {
+      const q = document.getElementById('question').value.trim();
+      if (!q) return;
+      messages.push({ role: "user", content: q });
+      renderMessages();
+      document.getElementById('question').value = "";
+
+      const resp = await fetch("/ask", {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ question: q })
+      });
+      const data = await resp.json();
+
+      messages.push({
+        role: "assistant",
+        content: data.answer || "(no response)",
+        image: data.image
+      });
+      renderMessages();
+    }
+
+    function enlargeImage(img) {
+      const modal = document.getElementById("imgModal");
+      const modalContent = document.getElementById("imgModalContent");
+      modalContent.src = img.src;
+      modal.style.display = "block";
+    }
+    function closeModal() {
+      document.getElementById("imgModal").style.display = "none";
+    }
+  </script>
 </body>
 </html>
 """
 
-@app.route('/')
-def index():
-    # 単純に上記HTMLテンプレートを返すだけ
-    return render_template_string(HTML_TEMPLATE)
-
-
-# --------------------------------
-# システムプロンプト: "自然言語→フィルタ条件(JSON)を出力して"
-# --------------------------------
-SYSTEM_PROMPT = """
-あなたは荷台形状や稼働時間などが書かれたCSVをフィルタする役割です。
-ユーザーの要望を受け、以下の形式のJSONのみを出力してください。
-出力以外の文章は書かないでください。
-
-JSON形式:
-{
-  "conditions": [
-    {
-      "column": "稼働時間",
-      "op": ">=",
-      "value": 3
-    },
-    {
-      "column": "荷台形状",
-      "op": "IN",
-      "value": ["ミキサ","ダンプ"]
-    },
-    ...
-  ],
-  "output": {
-    "type": "bar_chart",    // bar_chart, or line_chart... (今回はbar_chart想定)
-    "group_by": "安全装備パッケージ",
-    "aggregate": "count",   // count, or percentage
-    "title": "稼働時間3時間以上のミキサ・ダンプ"
-  }
-}
-
-※ 使える op は次の通り: ==, !=, IN, >=, <=, BETWEEN
-※ "value"は文字列 or 数値 or 配列
-※ "group_by"にはグラフの横軸に使いたい列を指定
-※ "aggregate"が "percentage"なら、各グループが全体に占める割合(%)を計算
-
-"""
-
-
-# --------------------------------
-# /chat エンドポイント
-# --------------------------------
-@app.route('/chat', methods=['POST'])
-def chat():
-    user_input = request.json.get('user_input', '')
-
-    # (1) ChatGPT(Azure OpenAI) へ問い合わせ - JSONを生成してもらう
-    try:
-        # ChatCompletion (Azure) は 'deployment_id' or 'engine' の指定が必要
-        # 例: deployment_name = "gpt-35-model" (Azure で作成した名前)
-        deployment_name = os.environ.get("OPENAI_DEPLOYMENT_NAME", "gpt-35-model")
-
-        response = openai.ChatCompletion.create(
-            engine=deployment_name,
-            messages = [
-                {"role":"system", "content": SYSTEM_PROMPT},
-                {"role":"user",   "content": user_input}
-            ],
-            temperature=0.2,
-            max_tokens=800,
-        )
-        ai_content = response['choices'][0]['message']['content']
-        
-    except Exception as e:
-        return jsonify({
-            "message": f"Azure OpenAIの呼び出しに失敗: {str(e)}"
-        })
-
-    # (2) OpenAIから返ってきた JSONパース
-    #     失敗した場合はエラーメッセージを返す
-    try:
-        # Azure側で余計な文章が混じる可能性があるため、正規表現などで { ... } 部分だけ抜き取ることも検討。
-        # ここでは一旦 json.loads() 試行
-        parsed = json.loads(ai_content)
-    except Exception as e:
-        return jsonify({
-            "message": f"ChatGPT応答のJSONパースに失敗: {str(e)}\n応答:\n{ai_content}"
-        })
-    
-    # (3) CSVを読み込み
-    df = pd.read_csv("data/survey_data.csv")
-
-    # (4) CSV列のうち「稼働時間」や「休憩時間」「燃費(km/L)」などの文字列を、数値範囲にパースする準備
-    #     ここでは例として「稼働時間」「休憩時間」は parse_hour_range() で範囲にするなど。
-    #     本格的には複数列対応が必要。サンプルとして稼働時間だけパース例を作ります。
-    def parse_hour_range(x):
-        """
-        '8～12時間' -> (8,12), '12時間以上' -> (12,999), '4時間未満' -> (0,4)等
-        """
-        x = str(x).strip()
-        if '以上' in x:
-            lower = int(x.replace('時間以上','').strip())
-            return (lower, 9999)
-        elif '未満' in x:
-            upper = int(x.replace('時間未満','').strip())
-            return (0, upper)
-        elif '～' in x:
-            # 例: "8～12時間"
-            tmp = x.replace('時間','').split('～')
-            lower = int(tmp[0])
-            upper = int(tmp[1])
-            return (lower, upper)
-        else:
-            # それ以外の形式: "3時間" などあれば適宜
-            try:
-                val = int(x.replace('時間',''))
-                return (val, val)
-            except:
-                return (0,0)
-    
-    # DataFrameに範囲用カラムを追加
-    df['稼働時間_range'] = df['稼働時間'].apply(parse_hour_range)
-    
-    # (5) フィルタ適用
-    def row_matches_condition(row, cond):
-        # cond は { "column":"稼働時間", "op":">=", "value":3 } など
-        col = cond["column"]
-        op  = cond["op"]
-        val = cond["value"]
-
-        # 特例: 稼働時間の場合は range と比較
-        if col == "稼働時間":
-            # row['稼働時間_range'] => (low, high)
-            (low, high) = row['稼働時間_range']
-            if op == ">=":
-                return low >= val
-            elif op == "<=":
-                return high <= val
-            elif op == "==":
-                # ある範囲内に val が含まれている？ など運用次第
-                return low <= val <= high
-            elif op == "BETWEEN":
-                # valが [v1, v2] だとして (low,high)全体がその範囲内かどうか？
-                # ここは要件に合わせて実装
-                if not isinstance(val, list) or len(val)!=2:
-                    return False
-                v1, v2 = val
-                return (low >= v1) and (high <= v2)
-            else:
-                return False
-        else:
-            # それ以外の列
-            cell_value = row[col]
-            
-            # 文字列 or 数値 どちらで比較するか？
-            # CSVが文字列の場合が多いので、ひとまず文字列前提
-            cell_value_str = str(cell_value).strip()
-            
-            # op に応じて判定
-            if op == "==":
-                # val が文字列の場合
-                return cell_value_str == str(val)
-            elif op == "!=":
-                return cell_value_str != str(val)
-            elif op == "IN":
-                if not isinstance(val, list):
-                    return False
-                return cell_value_str in [str(v) for v in val]
-            # >=, <= とかは、本来数値変換が必要
-            # 例: 燃費(km/L)列とか
-            # ここでは簡易的にやる
-            elif op == ">=":
-                try:
-                    cell_num = float(cell_value_str.replace('～','').replace('km','').replace('日',''))
-                    return cell_num >= float(val)
-                except:
-                    return False
-            elif op == "<=":
-                try:
-                    cell_num = float(cell_value_str.replace('～','').replace('km','').replace('日',''))
-                    return cell_num <= float(val)
-                except:
-                    return False
-            elif op == "BETWEEN":
-                # val = [v1,v2]
-                try:
-                    cell_num = float(cell_value_str.replace('～','').replace('km','').replace('日',''))
-                    v1, v2 = val
-                    return v1 <= cell_num <= v2
-                except:
-                    return False
-            else:
-                return False
-
-    def match_all_conditions(row, conditions):
-        # すべてAND判定 (複数conditions: "かつ")
-        for c in conditions:
-            if not row_matches_condition(row, c):
-                return False
-        return True
-
-    conditions = parsed.get("conditions", [])
-    df_filtered = df[df.apply(lambda r: match_all_conditions(r, conditions), axis=1)]
-
-    # (6) グラフ用パラメータを取り出す
-    output = parsed.get("output", {})
-    chart_type = output.get("type", "bar_chart")
-    group_by = output.get("group_by", "安全装備パッケージ")
-    aggregate = output.get("aggregate", "count")  # count or percentage
-    title = output.get("title", "フィルタ結果")
-
-    # (7) 集計: group_by列ごとに件数orパーセント
-    if len(df_filtered) == 0:
-        return jsonify({
-            "message": "条件に一致するデータがありませんでした。",
-        })
-    
-    group_count = df_filtered.groupby(group_by).size().reset_index(name='count')
-    if aggregate == "percentage":
-        total_count = group_count['count'].sum()
-        group_count['value'] = group_count['count'] / total_count * 100
-    else:
-        # count の場合
-        group_count['value'] = group_count['count']
-
-    # (8) グラフ描画
-    plt.rcParams['font.family'] = 'IPAexGothic'  # 日本語フォント(環境に合わせて)
-    fig, ax = plt.subplots(figsize=(6,4))
-    
-    # ブルー系グラデーション
-    cmap = plt.get_cmap('Blues')  
-    colors = [cmap(i/len(group_count)) for i in range(len(group_count))]
-    
-    ax.bar(group_count[group_by], group_count['value'], color=colors, edgecolor='black')
-    ax.set_title(title)
-    ax.set_xlabel(group_by)
-    if aggregate == "percentage":
-        ax.set_ylabel('割合(%)')
-    else:
-        ax.set_ylabel('件数')
-    
-    # 背景グリッド
-    ax.grid(axis='y', linestyle='--', alpha=0.7)
-    plt.xticks(rotation=45, ha='right')
-
-    # 画像をメモリに保存
-    buf = io.BytesIO()
-    plt.tight_layout()
-    plt.savefig(buf, format='png')
-    buf.seek(0)
-    graph_base64 = base64.b64encode(buf.read()).decode('utf-8')
-    plt.close()
-
-    return jsonify({
-        "message": f"グラフを生成しました。(抽出件数: {len(df_filtered)})",
-        "graph_base64": graph_base64
-    })
-
-
-# --------------------------------
-# メイン
-# --------------------------------
 if __name__ == "__main__":
-    # Render 上ではポートが固定になるので、$PORT を取得してlistenする
-    port = int(os.environ.get("PORT", 5000))
-    app.run(host="0.0.0.0", port=port, debug=False)
+    app.run(host="0.0.0.0", port=5000, debug=True)
